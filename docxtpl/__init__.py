@@ -7,11 +7,12 @@ Created : 2015-03-12
 import functools
 import io
 
-__version__ = '0.6.4'
+__version__ = '0.9.2'
 
 from lxml import etree
 from docx import Document
-from docx.opc.oxml import serialize_part_xml, parse_xml
+from docx.opc.oxml import parse_xml
+from docx.opc.part import XmlPart
 import docx.oxml.ns
 from docx.opc.constants import RELATIONSHIP_TYPE as REL_TYPE
 from jinja2 import Environment, Template, meta
@@ -43,6 +44,7 @@ class DocxTemplate(object):
         self.docx = Document(docx)
         self.crc_to_new_media = {}
         self.crc_to_new_embedded = {}
+        self.zipname_to_replace = {}
         self.pic_to_replace = {}
         self.pic_map = {}
 
@@ -60,60 +62,66 @@ class DocxTemplate(object):
     def get_xml(self):
         return self.xml_to_string(self.docx._element.body)
 
-    def write_xml(self,filename):
-        with open(filename,'w') as fh:
+    def write_xml(self, filename):
+        with open(filename, 'w') as fh:
             fh.write(self.get_xml())
 
-    def patch_xml(self,src_xml):
+    def patch_xml(self, src_xml):
         # strip all xml tags inside {% %} and {{ }} that MS word can insert
         # into xml source also unescape html entities
-        src_xml = re.sub(r'(?<={)(<[^>]*>)+(?=[\{%])|(?<=[%\}])(<[^>]*>)+(?=\})','',
-                         src_xml,flags=re.DOTALL)
+        src_xml = re.sub(r'(?<={)(<[^>]*>)+(?=[\{%])|(?<=[%\}])(<[^>]*>)+(?=\})', '',
+                         src_xml, flags=re.DOTALL)
+
         def striptags(m):
-            return re.sub('</w:t>.*?(<w:t>|<w:t [^>]*>)','',
-                          m.group(0),flags=re.DOTALL)
-        src_xml = re.sub(r'{%(?:(?!%}).)*|{{(?:(?!}}).)*',striptags,
-                         src_xml,flags=re.DOTALL)
+            return re.sub('</w:t>.*?(<w:t>|<w:t [^>]*>)', '',
+                          m.group(0), flags=re.DOTALL)
+        src_xml = re.sub(r'{%(?:(?!%}).)*|{{(?:(?!}}).)*', striptags,
+                         src_xml, flags=re.DOTALL)
 
         # manage table cell colspan
         def colspan(m):
             cell_xml = m.group(1) + m.group(3)
             cell_xml = re.sub(r'<w:r[ >](?:(?!<w:r[ >]).)*<w:t></w:t>.*?</w:r>',
-                              '', cell_xml,flags=re.DOTALL)
-            cell_xml = re.sub(r'<w:gridSpan[^/]*/>','', cell_xml, count=1)
-            return re.sub(r'(<w:tcPr[^>]*>)',r'\1<w:gridSpan w:val="{{%s}}"/>'
-                          % m.group(2), cell_xml )
+                              '', cell_xml, flags=re.DOTALL)
+            cell_xml = re.sub(r'<w:gridSpan[^/]*/>', '', cell_xml, count=1)
+            return re.sub(r'(<w:tcPr[^>]*>)', r'\1<w:gridSpan w:val="{{%s}}"/>'
+                          % m.group(2), cell_xml)
         src_xml = re.sub(r'(<w:tc[ >](?:(?!<w:tc[ >]).)*){%\s*colspan\s+([^%]*)\s*%}(.*?</w:tc>)',
-                         colspan,src_xml,flags=re.DOTALL)
+                         colspan, src_xml, flags=re.DOTALL)
 
         # manage table cell background color
         def cellbg(m):
             cell_xml = m.group(1) + m.group(3)
             cell_xml = re.sub(r'<w:r[ >](?:(?!<w:r[ >]).)*<w:t></w:t>.*?</w:r>',
-                              '',cell_xml,flags=re.DOTALL)
-            cell_xml = re.sub(r'<w:shd[^/]*/>','', cell_xml, count=1)
+                              '', cell_xml, flags=re.DOTALL)
+            cell_xml = re.sub(r'<w:shd[^/]*/>', '', cell_xml, count=1)
             return re.sub(r'(<w:tcPr[^>]*>)',
                           r'\1<w:shd w:val="clear" w:color="auto" w:fill="{{%s}}"/>'
                           % m.group(2), cell_xml)
         src_xml = re.sub(r'(<w:tc[ >](?:(?!<w:tc[ >]).)*){%\s*cellbg\s+([^%]*)\s*%}(.*?</w:tc>)',
-                         cellbg,src_xml,flags=re.DOTALL)
+                         cellbg, src_xml, flags=re.DOTALL)
 
         # avoid {{r and {%r tags to strip MS xml tags too far
         # ensure space preservation when splitting
         src_xml = re.sub(r'<w:t>((?:(?!<w:t>).)*)({{r\s.*?}}|{%r\s.*?%})',
                          r'<w:t xml:space="preserve">\1\2',
-                         src_xml,flags=re.DOTALL)
+                         src_xml, flags=re.DOTALL)
         src_xml = re.sub(r'({{r\s.*?}}|{%r\s.*?%})',
                          r'</w:t></w:r><w:r><w:t xml:space="preserve">\1</w:t></w:r><w:r><w:t xml:space="preserve">',
-                         src_xml,flags=re.DOTALL)
+                         src_xml, flags=re.DOTALL)
+
+        # {%- will merge with previous paragraph text
+        src_xml = re.sub(r'</w:t>(?:(?!</w:t>).)*?{%-', '{%', src_xml, flags=re.DOTALL)
+        # -%} will merge with next paragraph text
+        src_xml = re.sub(r'-%}(?:(?!<w:t[ >]).)*?<w:t[^>]*?>', '%}', src_xml, flags=re.DOTALL)
 
         for y in ['tr', 'tc', 'p', 'r']:
             # replace into xml code the row/paragraph/run containing
             # {%y xxx %} or {{y xxx}} template tag
             # by {% xxx %} or {{ xx }} without any surronding <w:y> tags :
             # This is mandatory to have jinja2 generating correct xml code
-            pat = r'<w:%(y)s[ >](?:(?!<w:%(y)s[ >]).)*({%%|{{)%(y)s ([^}%%]*(?:%%}|}})).*?</w:%(y)s>' % {'y':y}
-            src_xml = re.sub(pat, r'\1 \2',src_xml,flags=re.DOTALL)
+            pat = r'<w:%(y)s[ >](?:(?!<w:%(y)s[ >]).)*({%%|{{)%(y)s ([^}%%]*(?:%%}|}})).*?</w:%(y)s>' % {'y': y}
+            src_xml = re.sub(pat, r'\1 \2', src_xml, flags=re.DOTALL)
 
         # add vMerge
         # use {% vm %} to make this table cell and its copies be vertically merged within a {% for %}
@@ -189,19 +197,19 @@ class DocxTemplate(object):
                          h_merge_tc, src_xml, flags=re.DOTALL)
 
         def clean_tags(m):
-            return ( m.group(0)
-                     .replace(r"&#8216;","'")
-                     .replace('&lt;','<')
-                     .replace('&gt;','>')
-                     .replace(u'“',u'"')
-                     .replace(u'”',u'"')
-                     .replace(u"‘",u"'")
-                     .replace(u"’",u"'") )
-        src_xml = re.sub(r'(?<=\{[\{%])(.*?)(?=[\}%]})',clean_tags,src_xml)
+            return (m.group(0)
+                    .replace(r"&#8216;", "'")
+                    .replace('&lt;', '<')
+                    .replace('&gt;', '>')
+                    .replace(u'“', u'"')
+                    .replace(u'”', u'"')
+                    .replace(u"‘", u"'")
+                    .replace(u"’", u"'"))
+        src_xml = re.sub(r'(?<=\{[\{%])(.*?)(?=[\}%]})', clean_tags, src_xml)
 
         return src_xml
 
-    def render_xml(self,src_xml,context,jinja_env=None):
+    def render_xml(self, src_xml, context, jinja_env=None):
         src_xml = src_xml.replace(r'<w:p>', '\n<w:p>')
         try:
             if jinja_env:
@@ -216,14 +224,14 @@ class DocxTemplate(object):
                                        src_xml.splitlines()[line_number:(line_number + 7)])
             raise exc
         dst_xml = dst_xml.replace('\n<w:p>', '<w:p>')
-        dst_xml = ( dst_xml
-                    .replace('{_{','{{')
-                    .replace('}_}','}}')
-                    .replace('{_%','{%')
-                    .replace('%_}','%}') )
+        dst_xml = (dst_xml
+                   .replace('{_{', '{{')
+                   .replace('}_}', '}}')
+                   .replace('{_%', '{%')
+                   .replace('%_}', '%}'))
         return dst_xml
 
-    def build_xml(self,context,jinja_env=None):
+    def build_xml(self, context, jinja_env=None):
         xml = self.get_xml()
         xml = self.patch_xml(xml)
         xml = self.render_xml(xml, context, jinja_env)
@@ -236,16 +244,16 @@ class DocxTemplate(object):
 
     def get_headers_footers_xml(self, uri):
         for relKey, val in self.docx._part._rels.items():
-            if (val.reltype == uri) and (val._target._blob):
-                yield relKey, self.xml_to_string(parse_xml(val._target._blob))
+            if (val.reltype == uri) and (val.target_part.blob):
+                yield relKey, self.xml_to_string(parse_xml(val.target_part.blob))
 
-    def get_headers_footers_encoding(self,xml):
-        m = re.match(r'<\?xml[^\?]+\bencoding="([^"]+)"',xml,re.I)
+    def get_headers_footers_encoding(self, xml):
+        m = re.match(r'<\?xml[^\?]+\bencoding="([^"]+)"', xml, re.I)
         if m:
             return m.group(1)
         return 'utf-8'
 
-    def build_headers_footers_xml(self,context, uri,jinja_env=None):
+    def build_headers_footers_xml(self, context, uri, jinja_env=None):
         for relKey, xml in self.get_headers_footers_xml(uri):
             encoding = self.get_headers_footers_encoding(xml)
             xml = self.patch_xml(xml)
@@ -253,7 +261,11 @@ class DocxTemplate(object):
             yield relKey, xml.encode(encoding)
 
     def map_headers_footers_xml(self, relKey, xml):
-        self.docx._part._rels[relKey]._target._blob = xml
+        part = self.docx._part._rels[relKey].target_part
+        new_part = XmlPart.load(part.partname, part.content_type, xml, part.package)
+        for rId, rel in part.rels.items():
+            new_part.load_rel(rel.reltype, rel._target, rel.rId, rel.is_external)
+        self.docx._part._rels[relKey]._target = new_part
 
     def render(self, context, jinja_env=None, autoescape=False):
         if autoescape:
@@ -306,7 +318,7 @@ class DocxTemplate(object):
                 width = 0.0
                 new_average = None
                 for c in columns:
-                    if not c.get(ns+'w') == None:
+                    if not c.get(ns+'w') is None:
                         width += float(c.get(ns+'w'))
                 # try to keep proportion of table
                 if width > 0:
@@ -365,14 +377,13 @@ class DocxTemplate(object):
                     extra_space = removed_width / len(columns_left)
                     extra_space = int(extra_space)
 
-
                 for c in columns_left:
                     c.set(ns+'w', str(int(float(c.get(ns+'w')) + extra_space)))
 
         return tree
 
-    def new_subdoc(self,docpath=None):
-        return Subdoc(self,docpath)
+    def new_subdoc(self, docpath=None):
+        return Subdoc(self, docpath)
 
     @staticmethod
     def get_file_crc(file_obj):
@@ -385,7 +396,7 @@ class DocxTemplate(object):
         crc = (binascii.crc32(buf) & 0xFFFFFFFF)
         return crc
 
-    def replace_media(self,src_file,dst_file):
+    def replace_media(self, src_file, dst_file):
         """Replace one media by another one into a docx
 
         This has been done mainly because it is not possible to add images in
@@ -399,7 +410,8 @@ class DocxTemplate(object):
                 tpl.replace_media(io.BytesIO(image_stream), io.BytesIO(new_image_stream))
 
         Note: for images, the aspect ratio will be the same as the replaced image
-        Note2 : it is important to have the source media file as it is required
+
+        Note2: it is important to have the source media file as it is required
                 to calculate its CRC to find them in the docx
         """
 
@@ -410,7 +422,7 @@ class DocxTemplate(object):
             with open(dst_file, 'rb') as fh:
                 self.crc_to_new_media[crc] = fh.read()
 
-    def replace_pic(self,embedded_file,dst_file):
+    def replace_pic(self, embedded_file, dst_file):
         """Replace embedded picture with original-name given by embedded_file.
            (give only the file basename, not the full path)
            The new picture is given by dst_file (either a filename or a file-like
@@ -425,20 +437,20 @@ class DocxTemplate(object):
                for replace_embedded and replace_media)
         """
 
-        if hasattr(dst_file,'read'):
+        if hasattr(dst_file, 'read'):
             # NOTE: file extension not checked
-            self.pic_to_replace[embedded_file]=dst_file.read()
+            self.pic_to_replace[embedded_file] = dst_file.read()
         else:
-            emp_path,emb_ext=os.path.splitext(embedded_file)
-            dst_path,dst_ext=os.path.splitext(dst_file)
+            emp_path, emb_ext = os.path.splitext(embedded_file)
+            dst_path, dst_ext = os.path.splitext(dst_file)
 
-            if emb_ext!=dst_ext:
+            if emb_ext != dst_ext:
                 raise ValueError('replace_pic: extensions must match')
 
             with open(dst_file, 'rb') as fh:
-                self.pic_to_replace[embedded_file]=fh.read()
+                self.pic_to_replace[embedded_file] = fh.read()
 
-    def replace_embedded(self,src_file,dst_file):
+    def replace_embedded(self, src_file, dst_file):
         """Replace one embdded object by another one into a docx
 
         This has been done mainly because it is not possible to add images
@@ -455,8 +467,40 @@ class DocxTemplate(object):
             crc = self.get_file_crc(src_file)
             self.crc_to_new_embedded[crc] = fh.read()
 
+    def replace_zipname(self, zipname, dst_file):
+        """Replace one file in the docx file
+
+        First note that a MSWord .docx file is in fact a zip file.
+
+        This method can be used to replace document embedded in the docx template.
+
+        Some embedded document may have been modified by MSWord while saving
+        the template : thus replace_embedded() cannot be used as CRC is not the
+        same as the original file.
+
+        This method works for embdded MSWord file like Excel or PowerPoint file,
+        but won't work for others like PDF, Python or even Text files :
+        For these ones, MSWord generate an oleObjectNNN.bin file which is no
+        use to be replaced as it is encoded.
+
+        Syntax:
+
+        tpl.replace_zipname(
+            'word/embeddings/Feuille_Microsoft_Office_Excel1.xlsx',
+            'my_excel_file.xlsx')
+
+        The zipname is the one you can find when you open docx with WinZip,
+        7zip (Windows) or unzip -l (Linux). The zipname starts with
+        "word/embeddings/". Note that the file is renamed by MSWord,
+        so you have to guess a little bit...
+        """
+        with open(dst_file, 'rb') as fh:
+            self.zipname_to_replace[zipname] = fh.read()
+
     def post_processing(self, docx_file):
-        if self.crc_to_new_media or self.crc_to_new_embedded:
+        if (self.crc_to_new_media or
+                self.crc_to_new_embedded or
+                self.zipname_to_replace):
 
             if hasattr(docx_file, 'read'):
                 tmp_file = io.BytesIO()
@@ -474,11 +518,13 @@ class DocxTemplate(object):
                 with zipfile.ZipFile(docx_file, 'w') as zout:
                     for item in zin.infolist():
                         buf = zin.read(item.filename)
-                        if ( item.filename.startswith('word/media/') and
-                             item.CRC in self.crc_to_new_media ):
+                        if item.filename in self.zipname_to_replace:
+                            zout.writestr(item, self.zipname_to_replace[item.filename])
+                        elif (item.filename.startswith('word/media/') and
+                              item.CRC in self.crc_to_new_media):
                             zout.writestr(item, self.crc_to_new_media[item.CRC])
-                        elif ( item.filename.startswith('word/embeddings/')
-                               and item.CRC in self.crc_to_new_embedded ):
+                        elif (item.filename.startswith('word/embeddings/') and
+                              item.CRC in self.crc_to_new_embedded):
                             zout.writestr(item, self.crc_to_new_embedded[item.CRC])
                         else:
                             zout.writestr(item, buf)
@@ -494,70 +540,70 @@ class DocxTemplate(object):
             self.build_pic_map()
 
             # Do the actual replacement
-            for embedded_file,stream in six.iteritems(self.pic_to_replace):
+            for embedded_file, stream in six.iteritems(self.pic_to_replace):
                 if embedded_file not in self.pic_map:
                     raise ValueError('Picture "%s" not found in the docx template'
                                      % embedded_file)
-                self.pic_map[embedded_file][1]._blob=stream
+                self.pic_map[embedded_file][1]._blob = stream
 
     def build_pic_map(self):
         """Searches in docx template all the xml pictures tag and store them
         in pic_map dict"""
         if self.pic_to_replace:
             # Main document
-            part=self.docx.part
+            part = self.docx.part
             self.pic_map.update(self._img_filename_to_part(part))
 
             # Header/Footer
             for relid, rel in six.iteritems(self.docx.part.rels):
-                if rel.reltype in (REL_TYPE.HEADER,REL_TYPE.FOOTER):
+                if rel.reltype in (REL_TYPE.HEADER, REL_TYPE.FOOTER):
                     self.pic_map.update(self._img_filename_to_part(rel.target_part))
 
     def get_pic_map(self):
         return self.pic_map
 
-    def _img_filename_to_part(self,doc_part):
+    def _img_filename_to_part(self, doc_part):
 
-        et=etree.fromstring(doc_part.blob)
+        et = etree.fromstring(doc_part.blob)
 
-        part_map={}
+        part_map = {}
 
-        gds=et.xpath('//a:graphic/a:graphicData',namespaces=docx.oxml.ns.nsmap)
+        gds = et.xpath('//a:graphic/a:graphicData', namespaces=docx.oxml.ns.nsmap)
         for gd in gds:
-            rel=None
+            rel = None
             # Either IMAGE, CHART, SMART_ART, ...
             try:
-                if gd.attrib['uri']==docx.oxml.ns.nsmap['pic']:
+                if gd.attrib['uri'] == docx.oxml.ns.nsmap['pic']:
                     # Either PICTURE or LINKED_PICTURE image
-                    blip=gd.xpath('pic:pic/pic:blipFill/a:blip',
-                                  namespaces=docx.oxml.ns.nsmap)[0]
-                    dest=blip.xpath('@r:embed',namespaces=docx.oxml.ns.nsmap)
-                    if len(dest)>0:
-                        rel=dest[0]
+                    blip = gd.xpath('pic:pic/pic:blipFill/a:blip',
+                                    namespaces=docx.oxml.ns.nsmap)[0]
+                    dest = blip.xpath('@r:embed', namespaces=docx.oxml.ns.nsmap)
+                    if len(dest) > 0:
+                        rel = dest[0]
                     else:
                         continue
                 else:
                     continue
 
-                #title=inl.xpath('wp:docPr/@title',namespaces=docx.oxml.ns.nsmap)[0]
-                name=gd.xpath('pic:pic/pic:nvPicPr/pic:cNvPr/@name',
-                              namespaces=docx.oxml.ns.nsmap)[0]
+                # title=inl.xpath('wp:docPr/@title',namespaces=docx.oxml.ns.nsmap)[0]
+                name = gd.xpath('pic:pic/pic:nvPicPr/pic:cNvPr/@name',
+                                namespaces=docx.oxml.ns.nsmap)[0]
 
-                part_map[name]=(doc_part.rels[rel].target_ref,
-                                doc_part.rels[rel].target_part)
-
-            except:
+                part_map[name] = (doc_part.rels[rel].target_ref,
+                                  doc_part.rels[rel].target_part)
+            # FIXME: figure out what exceptions are thrown here and catch more specific exceptions
+            except Exception:
                 continue
 
         return part_map
 
-    def build_url_id(self,url):
+    def build_url_id(self, url):
         return self.docx._part.relate_to(url, REL_TYPE.HYPERLINK,
                                          is_external=True)
 
-    def save(self,filename,*args,**kwargs):
+    def save(self, filename, *args, **kwargs):
         self.pre_processing()
-        self.docx.save(filename,*args,**kwargs)
+        self.docx.save(filename, *args, **kwargs)
         self.post_processing(filename)
 
     def get_undeclared_template_variables(self, jinja_env=None):
@@ -575,19 +621,19 @@ class DocxTemplate(object):
 
 class Subdoc(object):
     """ Class for subdocument to insert into master document """
-    def __init__(self, tpl,docpath=None):
+    def __init__(self, tpl, docpath=None):
         self.tpl = tpl
         self.docx = tpl.get_docx()
         self.subdocx = Document(docpath)
         self.subdocx._part = self.docx._part
 
-    def __getattr__(self, name) :
+    def __getattr__(self, name):
         return getattr(self.subdocx, name)
 
     def _get_xml(self):
         if self.subdocx._element.body.sectPr is not None:
             self.subdocx._element.body.remove(self.subdocx._element.body.sectPr)
-        xml = re.sub(r'</?w:body[^>]*>','',etree.tostring(
+        xml = re.sub(r'</?w:body[^>]*>', '', etree.tostring(
             self.subdocx._element.body, encoding='unicode', pretty_print=False))
         return xml
 
@@ -612,18 +658,19 @@ class RichText(object):
         if text:
             self.add(text, **text_prop)
 
-    def add(self, text, style=None,
-                        color=None,
-                        highlight=None,
-                        size=None,
-                        subscript=None,
-                        superscript=None,
-                        bold=False,
-                        italic=False,
-                        underline=False,
-                        strike=False,
-                        font=None,
-                        url_id=None):
+    def add(self, text,
+            style=None,
+            color=None,
+            highlight=None,
+            size=None,
+            subscript=None,
+            superscript=None,
+            bold=False,
+            italic=False,
+            underline=False,
+            strike=False,
+            font=None,
+            url_id=None):
 
         # If a RichText is added
         if isinstance(text, RichText):
@@ -634,7 +681,7 @@ class RichText(object):
         if not isinstance(text, (six.text_type, six.binary_type)):
             text = six.text_type(text)
         if not isinstance(text, six.text_type):
-            text = text.decode('utf-8',errors='ignore')
+            text = text.decode('utf-8', errors='ignore')
         text = (escape(text)
                 .replace('\n', NEWLINE_XML)
                 .replace('\a', NEWPARAGRAPH_XML)
@@ -665,25 +712,23 @@ class RichText(object):
         if italic:
             prop += u'<w:i/>'
         if underline:
-            if underline not in ['single','double']:
+            if underline not in ['single', 'double']:
                 underline = 'single'
             prop += u'<w:u w:val="%s"/>' % underline
         if strike:
             prop += u'<w:strike/>'
         if font:
-            prop += ( u'<w:rFonts w:ascii="{font}" w:hAnsi="{font}" w:cs="{font}"/>'
-                      .format(font=font) )
-
+            prop += (u'<w:rFonts w:ascii="{font}" w:hAnsi="{font}" w:cs="{font}"/>'
+                     .format(font=font))
 
         xml = u'<w:r>'
         if prop:
             xml += u'<w:rPr>%s</w:rPr>' % prop
         xml += u'<w:t xml:space="preserve">%s</w:t></w:r>' % text
         if url_id:
-            xml = ( u'<w:hyperlink r:id="%s" w:tgtFrame="_blank">%s</w:hyperlink>'
-                    % (url_id, xml) )
+            xml = (u'<w:hyperlink r:id="%s" w:tgtFrame="_blank">%s</w:hyperlink>'
+                   % (url_id, xml))
         self.xml += xml
-
 
     def __unicode__(self):
         return self.xml
@@ -756,5 +801,3 @@ class InlineImage(object):
 
     def __html__(self):
         return self._insert_image()
-
-
